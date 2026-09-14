@@ -2,7 +2,7 @@
 // @name         ClipBridge - Force Copy to Windows Clipboard
 // @name:zh-CN   ClipBridge - 让无痕复制进入 Windows 剪贴板历史
 // @namespace    https://github.com/shenyouchudegou/ClipBridge
-// @version      1.1.2
+// @version      1.1.3
 // @description  Re-write copied text through Tampermonkey so Windows clipboard history can capture copies made in private browsing.
 // @description:zh-CN 拦截无痕窗口中的复制，通过 Tampermonkey 重写纯文本，使 Windows 剪贴板历史可以捕获。
 // @author       ClipBridge
@@ -22,6 +22,7 @@
 
   const DEBUG = false;
   let clipboardWriteInProgress = false;
+  let pendingKeyboardCopy = null;
 
   const log = (...args) => {
     if (DEBUG) console.debug('[ClipBridge]', ...args);
@@ -122,20 +123,24 @@
     }
   }
 
-  function isCopyShortcut(event) {
-    if (event.repeat || event.altKey || event.metaKey) return false;
-
-    const ctrlC = event.ctrlKey
-      && (event.code === 'KeyC' || event.key?.toLowerCase() === 'c');
-    const ctrlInsert = event.ctrlKey && (event.code === 'Insert' || event.key === 'Insert');
-
-    return ctrlC || ctrlInsert;
+  function getCopyKey(event) {
+    if (event.code === 'KeyC' || event.key?.toLowerCase() === 'c') return 'c';
+    if (event.code === 'Insert' || event.key === 'Insert') return 'insert';
+    return null;
   }
 
-  function intercept(event, text, deferWrite = false) {
+  function isCopyShortcut(event) {
+    return !event.repeat
+      && !event.altKey
+      && !event.metaKey
+      && event.ctrlKey
+      && getCopyKey(event) !== null;
+  }
+
+  function cancelNativeCopy(event, text, deferred) {
     log(`Intercepted ${event.type}`, {
       characters: text.length,
-      deferred: deferWrite,
+      deferred,
     });
 
     // Block page handlers registered farther down the event path from replacing
@@ -143,17 +148,6 @@
     // write so it cannot add the Windows "do not keep in history" marker.
     event.preventDefault();
     event.stopImmediatePropagation();
-
-    if (deferWrite) {
-      // Calling execCommand('copy') from inside a copy event is recursive, so
-      // context-menu Copy must wait until the current copy dispatch has ended.
-      setTimeout(() => writeToWindowsClipboard(text), 0);
-      return;
-    }
-
-    // Keep Ctrl+C inside the trusted keyboard gesture. The re-entry guard lets
-    // Tampermonkey's internal copy event pass without calling GM_setClipboard again.
-    writeToWindowsClipboard(text);
   }
 
   window.addEventListener('keydown', (event) => {
@@ -162,7 +156,32 @@
     const text = getSelectedText(event);
     if (!text) return;
 
-    intercept(event, text);
+    // Calling GM_setClipboard here is still recursive in some Chromium builds:
+    // keydown is dispatched while the browser is processing its Ctrl+C command.
+    // Cancel that command now, then write during the matching trusted keyup.
+    pendingKeyboardCopy = {
+      key: getCopyKey(event),
+      text,
+    };
+    cancelNativeCopy(event, text, false);
+  }, { capture: true });
+
+  window.addEventListener('keyup', (event) => {
+    if (!event.isTrusted || !pendingKeyboardCopy) return;
+    if (getCopyKey(event) !== pendingKeyboardCopy.key) return;
+
+    const { text } = pendingKeyboardCopy;
+    pendingKeyboardCopy = null;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+
+    // keyup is a fresh trusted user gesture and is no longer inside Chromium's
+    // native copy command, so Tampermonkey can safely perform its internal copy.
+    writeToWindowsClipboard(text);
+  }, { capture: true });
+
+  window.addEventListener('blur', () => {
+    pendingKeyboardCopy = null;
   }, { capture: true });
 
   // Covers context-menu Copy and other browser/UI paths that emit a copy event.
@@ -171,9 +190,20 @@
     if (clipboardWriteInProgress) return;
     if (!event.isTrusted) return;
 
+    // Some Chromium builds may emit copy despite the cancelled keydown. Keep
+    // waiting for keyup instead of scheduling a second, non-gesture write.
+    if (pendingKeyboardCopy) {
+      cancelNativeCopy(event, pendingKeyboardCopy.text, false);
+      return;
+    }
+
     const text = getSelectedText(event);
     if (!text) return;
 
-    intercept(event, text, true);
+    cancelNativeCopy(event, text, true);
+
+    // A context-menu copy has no matching keyup. Defer until the current copy
+    // event has ended; support depends on the userscript manager's permissions.
+    setTimeout(() => writeToWindowsClipboard(text), 0);
   }, { capture: true });
 })();
